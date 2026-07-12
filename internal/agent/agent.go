@@ -39,6 +39,15 @@ type RunOpts struct {
 	// review-fix, test-evidence, ...). Instrumentation only; adapters
 	// ignore it.
 	Purpose string
+	// SessionFallbackReason is the low-cardinality reason a failed resume forced
+	// this fresh-session retry (see db.FallbackReason*). Set only when
+	// SessionFallback is true. Instrumentation only; adapters ignore it.
+	SessionFallbackReason string
+	// Workload, when non-nil, records the bounded size of the change this
+	// invocation is working over (files and net lines), so review/fix telemetry
+	// can be normalized without external git archaeology. Instrumentation only;
+	// adapters ignore it.
+	Workload *InvocationWorkload
 	// OnAttempt receives each concrete adapter attempt, including retries and
 	// fallback-provider attempts, after it completes. It is instrumentation
 	// only and must not change invocation behavior.
@@ -130,7 +139,8 @@ type Result struct {
 	// Text is the raw text output.
 	Text string
 	// Usage tracks token consumption for the invocation.
-	Usage TokenUsage
+	Usage         TokenUsage
+	UsageReported bool
 	// SessionID is the adapter-native session identity of this invocation
 	// when the adapter reports one. Callers persist it to resume later.
 	SessionID string
@@ -139,9 +149,26 @@ type Result struct {
 	// Model is the model the adapter reported serving this invocation, when
 	// available. Instrumentation only.
 	Model string
+	// ModelProvider is the provider that served the model (e.g. "openai",
+	// "anthropic"), when the adapter can report it. Instrumentation only.
+	ModelProvider string
 	// Provider is the adapter provider that served this invocation. It lets
 	// fallback wrappers persist a session against the provider that minted it.
 	Provider string
+	// Metrics is the bounded per-invocation activity evidence the adapter
+	// extracted from its event stream (round-trips, tool calls + categories,
+	// subprocess wait time). Nil means the adapter reported nothing, which is
+	// recorded as unknown (NULL) rather than a fabricated zero.
+	Metrics *InvocationMetrics
+	// CacheCreationReported reports whether Usage.CacheCreationTokens is a
+	// meaningful value. Adapters whose provider does not surface cache-creation
+	// cost (codex) leave it false so the field is recorded as unknown instead of
+	// a fabricated zero.
+	CacheCreationReported bool
+	// SessionUsageCumulative reports that Usage accumulates across a resumed
+	// durable session, so round N's counters include rounds 1..N-1. The pipeline
+	// uses it to record correct per-round token deltas (see PerRoundTokens).
+	SessionUsageCumulative bool
 }
 
 // TokenUsage tracks token consumption for an agent invocation.
@@ -150,6 +177,18 @@ type TokenUsage struct {
 	OutputTokens        int
 	CacheReadTokens     int
 	CacheCreationTokens int
+	// ReasoningTokens is the output tokens the model spent on hidden reasoning,
+	// when the provider reports it separately. Zero when not reported.
+	ReasoningTokens       int
+	Reported              bool
+	CacheCreationReported bool
+}
+
+// InvocationWorkload is the bounded size of the change an invocation works
+// over: changed files and net changed lines. It carries no paths or content.
+type InvocationWorkload struct {
+	Files int
+	Lines int
 }
 
 // Options configures backend-specific agent construction behavior.
@@ -163,7 +202,7 @@ func finalizeTextResult(agentName, text string, schema json.RawMessage, usage To
 		return nil, fmt.Errorf("%s returned no text output", agentName)
 	}
 	if len(schema) == 0 {
-		return &Result{Text: text, Usage: usage}, nil
+		return &Result{Text: text, Usage: usage, UsageReported: usage.Reported, CacheCreationReported: usage.CacheCreationReported}, nil
 	}
 
 	output, err := parseStructuredTextOutput(text, schema)
@@ -171,7 +210,7 @@ func finalizeTextResult(agentName, text string, schema json.RawMessage, usage To
 		return nil, fmt.Errorf("%s output parse: %w (output snippet: %q)", agentName, err, outputSnippet(text))
 	}
 
-	return &Result{Output: output, Text: text, Usage: usage}, nil
+	return &Result{Output: output, Text: text, Usage: usage, UsageReported: usage.Reported, CacheCreationReported: usage.CacheCreationReported}, nil
 }
 
 // outputSnippet returns a trimmed, length-capped excerpt of agent output for
@@ -678,6 +717,9 @@ func (u *TokenUsage) Add(other TokenUsage) {
 	u.OutputTokens += other.OutputTokens
 	u.CacheReadTokens += other.CacheReadTokens
 	u.CacheCreationTokens += other.CacheCreationTokens
+	u.ReasoningTokens += other.ReasoningTokens
+	u.Reported = u.Reported || other.Reported
+	u.CacheCreationReported = u.CacheCreationReported || other.CacheCreationReported
 }
 
 // New creates an agent by name with the given binary path.
